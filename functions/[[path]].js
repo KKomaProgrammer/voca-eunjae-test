@@ -17,11 +17,7 @@ const DEFAULT_TARGET_URL = "https://gemini.google.com/share/dbf04c4d0c13";
 // HTML 안에서 실행할 추가 JS 문자열.
 // Cloudflare Pages 환경변수 INJECTED_SCRIPT 로 덮어쓸 수 있습니다.
 const DEFAULT_INJECTED_SCRIPT = `
-/*
-  여기 코드는 가져온 HTML 안에서 실행됩니다.
-  예:
-  document.documentElement.setAttribute("data-proxied", "1");
-*/
+document.querySelector("top-bar-actions").remove();document.querySelector(".footer").remove();document.documentElement.style.setProperty('--bard-sidenav-open-closed-width-diff', '0px');document.querySelector("ch
 `;
 
 // true면 모든 https/http URL을 프록시합니다.
