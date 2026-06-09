@@ -2,8 +2,6 @@
 
 const DEFAULT_TARGET_URL = "https://gemini.google.com/share/dbf04c4d0c13";
 
-// 사용자가 말한 실행 코드.
-// 마지막 document.querySelector("ch... 부분은 메시지에서 잘려 있어 넣지 않았습니다.
 const DEFAULT_INJECTED_SCRIPT = `
 (() => {
   function cleanGeminiUI() {
@@ -32,6 +30,7 @@ const DEFAULT_ALLOW_ANY_HTTPS = false;
 
 const DEFAULT_ALLOWED_HOST_SUFFIXES = [
   "gemini.google.com",
+  "accounts.google.com",
   "google.com",
   "gstatic.com",
   "googleusercontent.com",
@@ -66,16 +65,16 @@ const STRIP_RESPONSE_HEADERS = [
   "cross-origin-resource-policy",
   "permissions-policy",
   "clear-site-data",
-  "set-cookie",
-  "set-cookie2",
-  "content-length"
+  "content-length",
+  "content-encoding",
+  "transfer-encoding",
+  "alt-svc"
 ];
 
 const STRIP_REQUEST_HEADERS = [
   "host",
   "origin",
   "referer",
-  "cookie",
   "authorization",
   "proxy-authorization",
   "connection",
@@ -128,6 +127,14 @@ function toAbsoluteUrl(raw, baseUrl) {
   }
 }
 
+function isSameOrigin(absUrl, origin) {
+  try {
+    return new URL(absUrl).origin === origin;
+  } catch (_) {
+    return false;
+  }
+}
+
 function getHostSuffixes(primaryTargetUrl) {
   const set = new Set(DEFAULT_ALLOWED_HOST_SUFFIXES);
 
@@ -137,14 +144,6 @@ function getHostSuffixes(primaryTargetUrl) {
   } catch (_) {}
 
   return Array.from(set);
-}
-
-function isSameOrigin(absUrl, origin) {
-  try {
-    return new URL(absUrl).origin === origin;
-  } catch (_) {
-    return false;
-  }
 }
 
 function isAllowedTarget(absUrl, allowAnyHttps, hostSuffixes) {
@@ -173,8 +172,6 @@ function proxifyUrl(raw, baseUrl, appOrigin, allowAnyHttps, hostSuffixes) {
   const abs = toAbsoluteUrl(raw, baseUrl);
   if (!abs) return raw;
 
-  // 핵심 수정:
-  // 자기 자신의 Pages 주소를 다시 /__proxy로 감싸면 무한 리디렉션/무한 프록시가 발생합니다.
   if (isSameOrigin(abs, appOrigin)) return abs;
 
   if (!isAllowedTarget(abs, allowAnyHttps, hostSuffixes)) return raw;
@@ -243,11 +240,83 @@ function rewriteCssUrls(cssText, baseUrl, appOrigin, allowAnyHttps, hostSuffixes
   return out;
 }
 
-function cleanResponseHeaders(upstreamHeaders, contentType) {
-  const headers = new Headers(upstreamHeaders);
+function splitSetCookieHeader(value) {
+  if (!value) return [];
 
-  for (const name of STRIP_RESPONSE_HEADERS) {
-    headers.delete(name);
+  return String(value)
+    .split(/,(?=\s*[^;,=\s]+=[^;,]*)/g)
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
+function getSetCookieArray(headers) {
+  try {
+    if (typeof headers.getSetCookie === "function") {
+      return headers.getSetCookie();
+    }
+  } catch (_) {}
+
+  const one = headers.get("set-cookie");
+  return splitSetCookieHeader(one);
+}
+
+function rewriteSetCookie(setCookieValue) {
+  if (!setCookieValue) return "";
+
+  const parts = String(setCookieValue)
+    .split(";")
+    .map((v) => v.trim())
+    .filter(Boolean);
+
+  if (!parts.length) return "";
+
+  const first = parts[0];
+  const attrs = [];
+
+  for (let i = 1; i < parts.length; i++) {
+    const attr = parts[i];
+    const key = attr.split("=")[0].trim().toLowerCase();
+
+    if (key === "domain") continue;
+    if (key === "path") continue;
+    if (key === "samesite") continue;
+    if (key === "partitioned") continue;
+
+    attrs.push(attr);
+  }
+
+  const hasSecure = attrs.some((v) => v.toLowerCase() === "secure");
+
+  attrs.push("Path=/");
+  attrs.push("SameSite=Lax");
+
+  if (!hasSecure) {
+    attrs.push("Secure");
+  }
+
+  return [first, ...attrs].join("; ");
+}
+
+function cleanResponseHeaders(upstreamHeaders, contentType) {
+  const headers = new Headers();
+
+  for (const [key, value] of upstreamHeaders.entries()) {
+    const lower = key.toLowerCase();
+
+    if (lower === "set-cookie") continue;
+    if (STRIP_RESPONSE_HEADERS.includes(lower)) continue;
+
+    headers.set(key, value);
+  }
+
+  const setCookies = getSetCookieArray(upstreamHeaders);
+
+  for (const cookie of setCookies) {
+    const rewritten = rewriteSetCookie(cookie);
+
+    if (rewritten) {
+      headers.append("set-cookie", rewritten);
+    }
   }
 
   headers.set("access-control-allow-origin", "*");
@@ -255,6 +324,7 @@ function cleanResponseHeaders(upstreamHeaders, contentType) {
   headers.set("access-control-allow-headers", "*");
   headers.set("access-control-expose-headers", "*");
   headers.set("referrer-policy", "no-referrer");
+  headers.set("cache-control", "no-store");
 
   if (contentType) {
     headers.set("content-type", contentType);
@@ -340,8 +410,6 @@ function makeClientPatchScript(originalUrl, injectedScript) {
       const abs = toAbsolute(str);
       if (!/^https?:\\/\\//i.test(abs)) return value;
 
-      // 핵심 수정:
-      // 현재 Pages 자기 자신의 URL은 다시 프록시하지 않음.
       try {
         if (new URL(abs).origin === location.origin) return abs;
       } catch (_) {}
@@ -737,69 +805,20 @@ async function handleOptions() {
   });
 }
 
-async function fetchUpstreamWithRedirectLimit(request, targetUrl, maxRedirects) {
-  let currentUrl = targetUrl;
-  let method = request.method.toUpperCase();
-  let redirected = 0;
+async function fetchUpstreamOnce(request, targetUrl) {
+  const method = request.method.toUpperCase();
 
-  while (true) {
-    const headers = buildUpstreamHeaders(request, currentUrl);
+  const init = {
+    method,
+    headers: buildUpstreamHeaders(request, targetUrl),
+    redirect: "manual"
+  };
 
-    const init = {
-      method,
-      headers,
-      redirect: "manual"
-    };
-
-    if (!["GET", "HEAD"].includes(method)) {
-      init.body = request.body;
-    }
-
-    const response = await fetch(currentUrl, init);
-
-    const location = response.headers.get("location");
-
-    if (
-      response.status >= 300 &&
-      response.status < 400 &&
-      location &&
-      ["GET", "HEAD"].includes(method)
-    ) {
-      redirected++;
-
-      if (redirected > maxRedirects) {
-        return {
-          response: new Response(
-            "Too many upstream redirects. TARGET_URL 또는 원본 사이트의 리다이렉트가 반복되고 있습니다.",
-            {
-              status: 508,
-              headers: {
-                "content-type": "text/plain; charset=utf-8"
-              }
-            }
-          ),
-          finalUrl: currentUrl
-        };
-      }
-
-      const nextUrl = toAbsoluteUrl(location, currentUrl);
-
-      if (!nextUrl) {
-        return {
-          response,
-          finalUrl: currentUrl
-        };
-      }
-
-      currentUrl = nextUrl;
-      continue;
-    }
-
-    return {
-      response,
-      finalUrl: currentUrl
-    };
+  if (!["GET", "HEAD"].includes(method)) {
+    init.body = request.body;
   }
+
+  return fetch(targetUrl, init);
 }
 
 async function proxyRequest(context, targetUrl) {
@@ -829,20 +848,18 @@ async function proxyRequest(context, targetUrl) {
     });
   }
 
-  // 핵심 수정:
-  // TARGET_URL이 자기 자신의 Pages 주소면 절대 프록시하지 않음.
   if (isSameOrigin(normalizedTarget, appOrigin)) {
     return new Response(
       [
         "TARGET_URL이 현재 Pages 주소와 같습니다.",
         "",
-        "이러면 Cloudflare가 자기 자신을 계속 fetch해서 ERR_TOO_MANY_REDIRECTS가 납니다.",
+        "TARGET_URL에는 프록시 사이트 주소가 아니라 원본 주소를 넣어야 합니다.",
         "",
         `현재 Pages 주소: ${appOrigin}`,
         `현재 TARGET_URL: ${normalizedTarget}`,
         "",
-        "Cloudflare Pages 환경변수 TARGET_URL을 원본 주소로 바꾸세요.",
-        "예: https://gemini.google.com/share/dbf04c4d0c13"
+        "올바른 예:",
+        "TARGET_URL=https://gemini.google.com/share/dbf04c4d0c13"
       ].join("\n"),
       {
         status: 508,
@@ -865,7 +882,7 @@ async function proxyRequest(context, targetUrl) {
         "Blocked host.",
         "",
         "허용되지 않은 호스트입니다.",
-        "ALLOW_ANY_HTTPS=true로 열 수도 있지만, 오픈 프록시가 되므로 권장하지 않습니다.",
+        "필요하면 DEFAULT_ALLOWED_HOST_SUFFIXES에 도메인을 추가하세요.",
         "",
         `URL: ${normalizedTarget}`
       ].join("\n"),
@@ -879,12 +896,9 @@ async function proxyRequest(context, targetUrl) {
   }
 
   let upstream;
-  let finalUrl;
 
   try {
-    const result = await fetchUpstreamWithRedirectLimit(request, normalizedTarget, 8);
-    upstream = result.response;
-    finalUrl = result.finalUrl;
+    upstream = await fetchUpstreamOnce(request, normalizedTarget);
   } catch (e) {
     return new Response(
       "Upstream fetch failed: " + (e && e.message ? e.message : String(e)),
@@ -904,10 +918,11 @@ async function proxyRequest(context, targetUrl) {
     upstream.status < 400 &&
     location
   ) {
-    const absoluteLocation = toAbsoluteUrl(location, finalUrl);
+    const absoluteLocation = toAbsoluteUrl(location, normalizedTarget);
+
     const proxiedLocation = proxifyUrl(
-      absoluteLocation,
-      finalUrl,
+      absoluteLocation || location,
+      normalizedTarget,
       appOrigin,
       allowAnyHttps,
       hostSuffixes
@@ -934,9 +949,9 @@ async function proxyRequest(context, targetUrl) {
     });
 
     return new HTMLRewriter()
-      .on("head", new HeadInjector(finalUrl, injectedScript))
-      .on("html", new HtmlFallbackInjector(finalUrl, injectedScript))
-      .on("*", new UrlAttributeRewriter(finalUrl, appOrigin, allowAnyHttps, hostSuffixes))
+      .on("head", new HeadInjector(normalizedTarget, injectedScript))
+      .on("html", new HtmlFallbackInjector(normalizedTarget, injectedScript))
+      .on("*", new UrlAttributeRewriter(normalizedTarget, appOrigin, allowAnyHttps, hostSuffixes))
       .transform(response);
   }
 
@@ -945,7 +960,7 @@ async function proxyRequest(context, targetUrl) {
 
     const rewritten = rewriteCssUrls(
       css,
-      finalUrl,
+      normalizedTarget,
       appOrigin,
       allowAnyHttps,
       hostSuffixes
