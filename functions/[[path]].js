@@ -1196,5 +1196,24 @@ export async function onRequest(context) {
   }
 
   const target = envText(env, "TARGET_URL", DEFAULT_TARGET_URL);
-  return proxyRequest(context, target);
-        }
+  const targetUrl = new URL(target);
+
+  // 핵심 수정:
+  // 루트 / 로 접속하면 Gemini 원본의 실제 path로 로컬 주소를 맞춤
+  // 예: / → /share/dbf04c4d0c13
+  if (url.pathname === "/" && targetUrl.pathname !== "/") {
+    const localShareUrl = new URL(request.url);
+    localShareUrl.pathname = targetUrl.pathname;
+    localShareUrl.search = targetUrl.search;
+
+    return Response.redirect(localShareUrl.href, 302);
+  }
+
+  // /share/dbf04c4d0c13 로 들어온 경우,
+  // 현재 로컬 path/search를 Gemini 원본 origin에 붙여서 가져옴
+  const upstreamUrl = new URL(target);
+  upstreamUrl.pathname = url.pathname;
+  upstreamUrl.search = url.search || targetUrl.search;
+
+  return proxyRequest(context, upstreamUrl.href);
+}
