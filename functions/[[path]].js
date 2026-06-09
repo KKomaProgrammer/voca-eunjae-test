@@ -13,6 +13,8 @@ const DEFAULT_INJECTED_SCRIPT = `
         "0px"
       );
     } catch (_) {}
+
+    // 사용자가 말한 document.querySelector("ch... 부분은 메시지에서 잘려 있어 넣지 않았습니다.
   }
 
   cleanGeminiUI();
@@ -31,13 +33,41 @@ const DEFAULT_ALLOW_ANY_HTTPS = false;
 const DEFAULT_ALLOWED_HOST_SUFFIXES = [
   "gemini.google.com",
   "accounts.google.com",
+
   "google.com",
+  "www.google.com",
+  "apis.google.com",
+  "ogs.google.com",
+
   "gstatic.com",
+  "www.gstatic.com",
+
   "googleusercontent.com",
+  "lh3.googleusercontent.com",
+
   "googleapis.com",
+  "fonts.googleapis.com",
+  "storage.googleapis.com",
+
   "ggpht.com",
+
   "youtube.com",
-  "ytimg.com"
+  "www.youtube.com",
+  "ytimg.com",
+  "i.ytimg.com",
+
+  "googletagmanager.com",
+  "www.googletagmanager.com",
+
+  "google-analytics.com",
+  "www.google-analytics.com",
+  "analytics.google.com",
+
+  "doubleclick.net",
+  "stats.g.doubleclick.net",
+
+  "googleadservices.com",
+  "googlesyndication.com"
 ];
 
 const URL_ATTRS = [
@@ -172,6 +202,7 @@ function proxifyUrl(raw, baseUrl, appOrigin, allowAnyHttps, hostSuffixes) {
   const abs = toAbsoluteUrl(raw, baseUrl);
   if (!abs) return raw;
 
+  // 자기 자신의 Pages 주소는 다시 프록시하지 않음
   if (isSameOrigin(abs, appOrigin)) return abs;
 
   if (!isAllowedTarget(abs, allowAnyHttps, hostSuffixes)) return raw;
@@ -361,6 +392,62 @@ function buildUpstreamHeaders(request, targetUrl) {
   );
 
   return headers;
+}
+
+function isDocumentNavigationRequest(request) {
+  const dest = request.headers.get("sec-fetch-dest") || "";
+  const mode = request.headers.get("sec-fetch-mode") || "";
+  const accept = request.headers.get("accept") || "";
+
+  return (
+    dest === "document" ||
+    dest === "iframe" ||
+    mode === "navigate" ||
+    accept.includes("text/html")
+  );
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function makeHtmlOnlyBlockPage(_targetUrl, appOrigin) {
+  return `<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>HTML Only</title>
+  <script>
+    setTimeout(() => {
+      location.replace(${JSON.stringify(appOrigin + "/")});
+    }, 50);
+  </script>
+</head>
+<body style="margin:0;background:#fff;font-family:system-ui,sans-serif"></body>
+</html>`;
+}
+
+function makeRootNonHtmlErrorPage(targetUrl) {
+  return `<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Invalid TARGET_URL</title>
+</head>
+<body style="font-family:system-ui,sans-serif;padding:24px;line-height:1.6">
+  <h2>TARGET_URL이 HTML 페이지가 아닙니다.</h2>
+  <p>현재 TARGET_URL이 HTML 문서가 아니라 JS/CSS/이미지 같은 리소스를 반환하고 있습니다.</p>
+  <pre style="white-space:pre-wrap;background:#f5f5f5;padding:12px;border-radius:8px">${escapeHtml(targetUrl)}</pre>
+  <p>TARGET_URL은 반드시 아래처럼 HTML 페이지 주소여야 합니다.</p>
+  <pre style="white-space:pre-wrap;background:#f5f5f5;padding:12px;border-radius:8px">https://gemini.google.com/share/dbf04c4d0c13</pre>
+</body>
+</html>`;
 }
 
 function makeClientPatchScript(originalUrl, injectedScript) {
@@ -913,6 +1000,7 @@ async function proxyRequest(context, targetUrl) {
 
   const location = upstream.headers.get("location");
 
+  // 리다이렉트는 서버가 계속 따라가지 않고, 브라우저에게 프록시 URL로 넘김
   if (
     upstream.status >= 300 &&
     upstream.status < 400 &&
@@ -941,7 +1029,35 @@ async function proxyRequest(context, targetUrl) {
   const contentType = upstream.headers.get("content-type") || "";
   const headers = cleanResponseHeaders(upstream.headers, contentType || null);
 
-  if (/text\/html|application\/xhtml\+xml/i.test(contentType)) {
+  const isHtmlResponse = /text\/html|application\/xhtml\+xml/i.test(contentType);
+  const isCssResponse = /text\/css/i.test(contentType);
+  const isDocumentRequest = isDocumentNavigationRequest(request);
+
+  // 핵심 수정:
+  // /__proxy?url=...gtm.js 같은 JS/CSS/이미지 주소가 화면 문서로 열리면
+  // JS 텍스트를 화면에 보여주지 않고 메인 HTML로 되돌림.
+  // 단, script/img/link/fetch 같은 리소스 요청은 그대로 반환함.
+  if (isDocumentRequest && !isHtmlResponse) {
+    if (requestUrl.pathname === "/__proxy") {
+      return new Response(makeHtmlOnlyBlockPage(normalizedTarget, appOrigin), {
+        status: 200,
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store"
+        }
+      });
+    }
+
+    return new Response(makeRootNonHtmlErrorPage(normalizedTarget), {
+      status: 200,
+      headers: {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-store"
+      }
+    });
+  }
+
+  if (isHtmlResponse) {
     const response = new Response(upstream.body, {
       status: upstream.status,
       statusText: upstream.statusText,
@@ -951,11 +1067,16 @@ async function proxyRequest(context, targetUrl) {
     return new HTMLRewriter()
       .on("head", new HeadInjector(normalizedTarget, injectedScript))
       .on("html", new HtmlFallbackInjector(normalizedTarget, injectedScript))
-      .on("*", new UrlAttributeRewriter(normalizedTarget, appOrigin, allowAnyHttps, hostSuffixes))
+      .on("*", new UrlAttributeRewriter(
+        normalizedTarget,
+        appOrigin,
+        allowAnyHttps,
+        hostSuffixes
+      ))
       .transform(response);
   }
 
-  if (/text\/css/i.test(contentType)) {
+  if (isCssResponse) {
     const css = await upstream.text();
 
     const rewritten = rewriteCssUrls(
@@ -1013,4 +1134,4 @@ export async function onRequest(context) {
   const target = envText(env, "TARGET_URL", DEFAULT_TARGET_URL);
 
   return proxyRequest(context, target);
-      }
+    }
