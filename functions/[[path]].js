@@ -516,7 +516,11 @@ function makeClientPatchScript(originalUrl, userScript) {
 
       console.log("[ProxyDebug]", line.type, line.message, line.detail || "");
 
-      updateDebugPanel(false);
+      // body 생성 전에는 패널을 DOM에 만들지 않음.
+      // head 파싱 중 div를 html에 넣으면 원본 HTML 파싱이 깨질 수 있음.
+      if (document.body || document.readyState !== "loading") {
+        updateDebugPanel(false);
+      }
     } catch (_) {}
   }
 
@@ -559,13 +563,21 @@ function makeClientPatchScript(originalUrl, userScript) {
   }
 
   function makeDebugPanel(forceFull) {
+    // body가 생기기 전에는 일반 로그 패널 생성 금지.
+    // forceFull일 때만 html에 붙여 강제 표시.
+    if (!document.body && !forceFull) {
+      return null;
+    }
+
     let panel = document.getElementById("__proxy_debug_panel");
 
     if (!panel) {
       panel = document.createElement("div");
       panel.id = "__proxy_debug_panel";
       panel.setAttribute("data-proxy-debug-panel", "1");
-      document.documentElement.appendChild(panel);
+
+      const parent = document.body || document.documentElement;
+      parent.appendChild(panel);
     }
 
     const shouldFull = forceFull || visibleTextLength() < 5;
@@ -582,6 +594,7 @@ function makeClientPatchScript(originalUrl, userScript) {
       if (!document.documentElement) return;
 
       const panel = makeDebugPanel(forceFull);
+      if (!panel) return;
 
       const rows = DEBUG_LINES.slice(-35).map((line) => {
         const color =
@@ -1533,4 +1546,4 @@ export async function onRequest(context) {
   upstreamUrl.search = url.search || targetUrl.search;
 
   return proxyRequest(context, upstreamUrl.href);
-}
+  }
