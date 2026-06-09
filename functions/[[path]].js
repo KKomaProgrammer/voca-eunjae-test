@@ -1,6 +1,6 @@
 const DEFAULT_TARGET_URL = "https://gemini.google.com/share/dbf04c4d0c13";
 
-const DEFAULT_ALLOW_ANY_HTTPS = false;
+const DEFAULT_ALLOW_ANY_HTTPS = true;
 
 const DEFAULT_USER_SCRIPT = `
 (() => {
@@ -494,6 +494,14 @@ function makeClientPatchScript(originalUrl, userScript) {
     return s.length > limit ? s.slice(0, limit) + "..." : s;
   }
 
+  function escapeForHtml(value) {
+    return String(value == null ? "" : value)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;");
+  }
+
   function addDebug(type, message, detail) {
     try {
       const line = {
@@ -556,6 +564,7 @@ function makeClientPatchScript(originalUrl, userScript) {
     if (!panel) {
       panel = document.createElement("div");
       panel.id = "__proxy_debug_panel";
+      panel.setAttribute("data-proxy-debug-panel", "1");
       document.documentElement.appendChild(panel);
     }
 
@@ -645,14 +654,6 @@ function makeClientPatchScript(originalUrl, userScript) {
     } catch (e) {
       console.error("[ProxyDebug panel error]", e);
     }
-  }
-
-  function escapeForHtml(value) {
-    return String(value == null ? "" : value)
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;");
   }
 
   addDebug("info", "Proxy patch start", "original=" + ORIGINAL_URL);
@@ -923,13 +924,32 @@ function makeClientPatchScript(originalUrl, userScript) {
     "imagesrcset"
   ]);
 
+  const nativeElementSetAttributeForProxy =
+    window.Element && Element.prototype.setAttribute
+      ? Element.prototype.setAttribute
+      : null;
+
   function patchElement(el) {
     if (!el || el.nodeType !== 1) return;
 
     try {
+      if (el.id === "__proxy_debug_panel" || el.closest?.("#__proxy_debug_panel")) {
+        return;
+      }
+
       if (el.tagName === "BASE") {
-        el.setAttribute("href", "/");
-        addDebug("info", "base href forced to /");
+        const current = el.getAttribute("href") || "";
+
+        if (current !== "/") {
+          if (nativeElementSetAttributeForProxy) {
+            nativeElementSetAttributeForProxy.call(el, "href", "/");
+          } else {
+            el.href = "/";
+          }
+
+          addDebug("info", "base href forced to / once");
+        }
+
         return;
       }
 
@@ -991,6 +1011,10 @@ function makeClientPatchScript(originalUrl, userScript) {
 
       try {
         if (this && this.tagName === "BASE" && n === "href") {
+          if (this.getAttribute("href") === "/") {
+            return;
+          }
+
           value = "/";
         } else if (URL_ATTRS.has(n)) {
           value = proxify(value);
@@ -1048,6 +1072,10 @@ function makeClientPatchScript(originalUrl, userScript) {
     try {
       if (!root) return;
 
+      if (root.id === "__proxy_debug_panel" || root.closest?.("#__proxy_debug_panel")) {
+        return;
+      }
+
       if (root.nodeType === 1) {
         patchElement(root);
       }
@@ -1068,7 +1096,26 @@ function makeClientPatchScript(originalUrl, userScript) {
   try {
     new MutationObserver((records) => {
       for (const record of records) {
+        if (
+          record.target &&
+          (
+            record.target.id === "__proxy_debug_panel" ||
+            record.target.closest?.("#__proxy_debug_panel")
+          )
+        ) {
+          continue;
+        }
+
         if (record.type === "attributes") {
+          if (
+            record.target &&
+            record.target.tagName === "BASE" &&
+            record.attributeName === "href" &&
+            record.target.getAttribute("href") === "/"
+          ) {
+            continue;
+          }
+
           patchElement(record.target);
         }
 
@@ -1486,4 +1533,4 @@ export async function onRequest(context) {
   upstreamUrl.search = url.search || targetUrl.search;
 
   return proxyRequest(context, upstreamUrl.href);
-    }
+}
