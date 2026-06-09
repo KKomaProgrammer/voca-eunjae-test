@@ -1,8 +1,0 @@
-name = "cf-pages-html-proxy"
-compatibility_date = "2026-06-08"
-pages_build_output_dir = "public"
-
-[vars]
-# 필요하면 Cloudflare Pages 대시보드의 Settings > Environment variables 에서 덮어쓸 수 있습니다.
-TARGET_URL = "https://gemini.google.com/share/dbf04c4d0c13"
-ALLOW_ANY_HTTPS = "true"

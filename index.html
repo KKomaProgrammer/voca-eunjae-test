@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title></title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      min-height: 100%;
+      background: #fff;
+    }
+    body {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+<script>
+(() => {
+  "use strict";
+
+  function safeRemove(selector) {
+    try {
+      const el = document.querySelector(selector);
+      if (el) el.remove();
+    } catch (_) {}
+  }
+
+  function runUserScript() {
+    try {
+      safeRemove("top-bar-actions");
+      safeRemove(".footer");
+
+      document.documentElement.style.setProperty(
+        "--bard-sidenav-open-closed-width-diff",
+        "0px"
+      );
+
+      /*
+        사용자 메시지의 document.querySelector("ch... 부분은 잘려 있어서 넣지 않았습니다.
+        추가 코드가 있으면 이곳에 넣으세요.
+      */
+    } catch (_) {}
+  }
+
+  runUserScript();
+
+  try {
+    new MutationObserver(runUserScript).observe(document.documentElement, {
+      childList: true,
+      subtree: true
+    });
+  } catch (_) {}
+
+  try {
+    document.documentElement.setAttribute("data-user-script-executed", "1");
+  } catch (_) {}
+})();
+</script>
+</body>
+</html>
