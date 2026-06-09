@@ -1,18 +1,14 @@
-// functions/[[path]].js
-
 const DEFAULT_TARGET_URL = "https://gemini.google.com/share/dbf04c4d0c13";
 
-const DEFAULT_INJECTED_SCRIPT = `
+const DEFAULT_ALLOW_ANY_HTTPS = false;
+
+const DEFAULT_USER_SCRIPT = `
 (() => {
-  function forceVisible() {
+  function cleanGeminiUI() {
+    try { document.querySelector("top-bar-actions")?.remove(); } catch (_) {}
+    try { document.querySelector(".footer")?.remove(); } catch (_) {}
+
     try {
-      document.documentElement.style.background = "#fff";
-
-      if (document.body) {
-        document.body.style.background = "#fff";
-        document.body.style.color = "#111";
-      }
-
       document.documentElement.style.setProperty(
         "--bard-sidenav-open-closed-width-diff",
         "0px"
@@ -20,48 +16,6 @@ const DEFAULT_INJECTED_SCRIPT = `
     } catch (_) {}
   }
 
-  function cleanGeminiUI() {
-    forceVisible();
-
-    try { document.querySelector("top-bar-actions")?.remove(); } catch (_) {}
-    try { document.querySelector(".footer")?.remove(); } catch (_) {}
-
-    /*
-      주의:
-      bard-app, chat-window, main, [role="main"], mat-sidenav-container 같은
-      핵심 요소는 remove() 하면 검은 화면/빈 화면이 됩니다.
-    */
-  }
-
-  function showDebugIfBlank() {
-    try {
-      const text = (document.body && document.body.innerText || "").trim();
-
-      const hasMain =
-        document.querySelector("bard-app") ||
-        document.querySelector("chat-window") ||
-        document.querySelector("main") ||
-        document.querySelector("[role='main']");
-
-      if (!text && !hasMain && !document.querySelector("#__proxy_blank_debug")) {
-        const box = document.createElement("div");
-
-        box.id = "__proxy_blank_debug";
-        box.style.cssText =
-          "position:fixed;inset:0;z-index:2147483647;background:white;color:#111;padding:20px;font:14px/1.6 system-ui,sans-serif;overflow:auto;";
-
-        box.innerHTML =
-          "<h2>Gemini 화면이 로드되지 않았습니다</h2>" +
-          "<p>HTML은 도착했지만 Gemini 앱 JavaScript 초기화가 실패했을 가능성이 큽니다.</p>" +
-          "<p>개발자도구 Console/Network에서 <b>Blocked host</b>, <b>403</b>, <b>404</b>, <b>CORS</b>, <b>module script</b> 오류를 확인하세요.</p>" +
-          "<p>사용자 주입 코드가 main, bard-app, chat-window 같은 핵심 요소를 지우면 화면이 비게 됩니다.</p>";
-
-        document.body.appendChild(box);
-      }
-    } catch (_) {}
-  }
-
-  forceVisible();
   cleanGeminiUI();
 
   try {
@@ -70,12 +24,8 @@ const DEFAULT_INJECTED_SCRIPT = `
       subtree: true
     });
   } catch (_) {}
-
-  setTimeout(showDebugIfBlank, 5000);
 })();
 `;
-
-const DEFAULT_ALLOW_ANY_HTTPS = false;
 
 const DEFAULT_ALLOWED_HOST_SUFFIXES = [
   "gemini.google.com",
@@ -391,9 +341,7 @@ function rewriteSetCookie(setCookieValue) {
   attrs.push("Path=/");
   attrs.push("SameSite=Lax");
 
-  if (!hasSecure) {
-    attrs.push("Secure");
-  }
+  if (!hasSecure) attrs.push("Secure");
 
   return [first, ...attrs].join("; ");
 }
@@ -414,10 +362,7 @@ function cleanResponseHeaders(upstreamHeaders, contentType) {
 
   for (const cookie of setCookies) {
     const rewritten = rewriteSetCookie(cookie);
-
-    if (rewritten) {
-      headers.append("set-cookie", rewritten);
-    }
+    if (rewritten) headers.append("set-cookie", rewritten);
   }
 
   headers.set("access-control-allow-origin", "*");
@@ -427,9 +372,7 @@ function cleanResponseHeaders(upstreamHeaders, contentType) {
   headers.set("referrer-policy", "no-referrer");
   headers.set("cache-control", "no-store");
 
-  if (contentType) {
-    headers.set("content-type", contentType);
-  }
+  if (contentType) headers.set("content-type", contentType);
 
   return headers;
 }
@@ -514,13 +457,13 @@ function makeRootNonHtmlErrorPage(targetUrl) {
   <h2>TARGET_URL이 HTML 페이지가 아닙니다.</h2>
   <p>현재 TARGET_URL이 HTML 문서가 아니라 JS/CSS/이미지 같은 리소스를 반환하고 있습니다.</p>
   <pre style="white-space:pre-wrap;background:#f5f5f5;padding:12px;border-radius:8px">${escapeHtml(targetUrl)}</pre>
-  <p>TARGET_URL은 반드시 아래처럼 HTML 페이지 주소여야 합니다.</p>
+  <p>TARGET_URL은 반드시 HTML 페이지 주소여야 합니다.</p>
   <pre style="white-space:pre-wrap;background:#f5f5f5;padding:12px;border-radius:8px">https://gemini.google.com/share/dbf04c4d0c13</pre>
 </body>
 </html>`;
 }
 
-function makeClientPatchScript(originalUrl, injectedScript) {
+function makeClientPatchScript(originalUrl, userScript) {
   return `
 <script>
 (() => {
@@ -530,10 +473,266 @@ function makeClientPatchScript(originalUrl, injectedScript) {
   window.__CF_PAGES_PROXY_PATCHED__ = true;
 
   const ORIGINAL_URL = ${JSON.stringify(originalUrl)};
-  const USER_SCRIPT = ${JSON.stringify(injectedScript || "")};
+  const USER_SCRIPT = ${JSON.stringify(userScript || "")};
   const PROXY_PATH = "/__proxy?url=";
 
   window.__PROXY_ORIGINAL_URL__ = ORIGINAL_URL;
+
+  const DEBUG_LINES = [];
+  const DEBUG_MAX = 120;
+
+  function nowText() {
+    try {
+      return new Date().toLocaleTimeString();
+    } catch (_) {
+      return String(Date.now());
+    }
+  }
+
+  function shortText(value, limit) {
+    const s = String(value == null ? "" : value);
+    return s.length > limit ? s.slice(0, limit) + "..." : s;
+  }
+
+  function addDebug(type, message, detail) {
+    try {
+      const line = {
+        time: nowText(),
+        type: String(type || "info"),
+        message: shortText(message || "", 500),
+        detail: detail ? shortText(detail, 1200) : ""
+      };
+
+      DEBUG_LINES.push(line);
+      while (DEBUG_LINES.length > DEBUG_MAX) DEBUG_LINES.shift();
+
+      console.log("[ProxyDebug]", line.type, line.message, line.detail || "");
+
+      updateDebugPanel(false);
+    } catch (_) {}
+  }
+
+  window.__proxyDebug = addDebug;
+
+  function visibleTextLength() {
+    try {
+      return ((document.body && document.body.innerText) || "").trim().length;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  function hasGeminiMainElement() {
+    try {
+      return !!(
+        document.querySelector("bard-app") ||
+        document.querySelector("chat-window") ||
+        document.querySelector("main") ||
+        document.querySelector("[role='main']") ||
+        document.querySelector("mat-sidenav-container")
+      );
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function forceWhiteBackground() {
+    try {
+      document.documentElement.style.background = "#fff";
+      document.documentElement.style.color = "#111";
+      document.documentElement.style.minHeight = "100%";
+
+      if (document.body) {
+        document.body.style.background = "#fff";
+        document.body.style.color = "#111";
+        document.body.style.minHeight = "100%";
+      }
+    } catch (_) {}
+  }
+
+  function makeDebugPanel(forceFull) {
+    let panel = document.getElementById("__proxy_debug_panel");
+
+    if (!panel) {
+      panel = document.createElement("div");
+      panel.id = "__proxy_debug_panel";
+      document.documentElement.appendChild(panel);
+    }
+
+    const shouldFull = forceFull || visibleTextLength() < 5;
+
+    panel.style.cssText = shouldFull
+      ? "position:fixed;inset:0;z-index:2147483647;background:#fff;color:#111;padding:18px;font:13px/1.55 system-ui,-apple-system,BlinkMacSystemFont,sans-serif;overflow:auto;box-sizing:border-box;"
+      : "position:fixed;right:8px;bottom:8px;z-index:2147483647;background:#fff;color:#111;border:1px solid #ddd;border-radius:10px;padding:10px;font:12px/1.45 system-ui,sans-serif;max-width:460px;max-height:45vh;overflow:auto;box-shadow:0 4px 24px rgba(0,0,0,.18);";
+
+    return panel;
+  }
+
+  function updateDebugPanel(forceFull) {
+    try {
+      if (!document.documentElement) return;
+
+      const panel = makeDebugPanel(forceFull);
+
+      const rows = DEBUG_LINES.slice(-35).map((line) => {
+        const color =
+          line.type === "error" ? "#b00020" :
+          line.type === "warn" ? "#8a5a00" :
+          line.type === "resource" ? "#0057b8" :
+          "#333";
+
+        return "<div style='border-top:1px solid #eee;padding:6px 0;white-space:pre-wrap;word-break:break-word'>" +
+          "<b style='color:" + color + "'>[" + escapeForHtml(line.time) + "] " + escapeForHtml(line.type) + "</b> " +
+          escapeForHtml(line.message) +
+          (line.detail ? "<br><span style='color:#666'>" + escapeForHtml(line.detail) + "</span>" : "") +
+          "</div>";
+      }).join("");
+
+      const info = {
+        href: location.href,
+        original: ORIGINAL_URL,
+        title: document.title,
+        readyState: document.readyState,
+        textLength: visibleTextLength(),
+        hasMain: hasGeminiMainElement(),
+        scripts: document.scripts ? document.scripts.length : 0,
+        styles: document.styleSheets ? document.styleSheets.length : 0,
+        base: document.querySelector("base") ? document.querySelector("base").getAttribute("href") : ""
+      };
+
+      panel.innerHTML =
+        "<h2 style='margin:0 0 8px;font-size:18px'>Proxy Debug</h2>" +
+        "<div style='margin-bottom:8px'>Gemini 제목은 왔지만 화면이 검으면, 아래 첫 번째 빨간 오류/리소스 실패가 원인입니다.</div>" +
+        "<pre style='background:#f5f5f5;border-radius:8px;padding:10px;white-space:pre-wrap;word-break:break-word'>" +
+        escapeForHtml(JSON.stringify(info, null, 2)) +
+        "</pre>" +
+        "<div style='display:flex;gap:8px;flex-wrap:wrap;margin:8px 0'>" +
+        "<button id='__proxy_hide_debug' style='padding:6px 10px'>숨기기</button>" +
+        "<button id='__proxy_reload_debug' style='padding:6px 10px'>새로고침</button>" +
+        "<button id='__proxy_copy_debug' style='padding:6px 10px'>로그 복사</button>" +
+        "</div>" +
+        rows;
+
+      const hideBtn = document.getElementById("__proxy_hide_debug");
+      const reloadBtn = document.getElementById("__proxy_reload_debug");
+      const copyBtn = document.getElementById("__proxy_copy_debug");
+
+      if (hideBtn) {
+        hideBtn.onclick = () => {
+          panel.remove();
+        };
+      }
+
+      if (reloadBtn) {
+        reloadBtn.onclick = () => {
+          location.reload();
+        };
+      }
+
+      if (copyBtn) {
+        copyBtn.onclick = async () => {
+          try {
+            await navigator.clipboard.writeText(JSON.stringify({
+              info,
+              lines: DEBUG_LINES
+            }, null, 2));
+            addDebug("info", "디버그 로그를 클립보드에 복사했습니다.");
+          } catch (e) {
+            addDebug("error", "클립보드 복사 실패", e && e.message ? e.message : String(e));
+          }
+        };
+      }
+    } catch (e) {
+      console.error("[ProxyDebug panel error]", e);
+    }
+  }
+
+  function escapeForHtml(value) {
+    return String(value == null ? "" : value)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;");
+  }
+
+  addDebug("info", "Proxy patch start", "original=" + ORIGINAL_URL);
+
+  window.addEventListener("error", (event) => {
+    try {
+      const target = event.target;
+
+      if (target && target !== window) {
+        const tag = target.tagName || "RESOURCE";
+        const url =
+          target.src ||
+          target.href ||
+          target.currentSrc ||
+          target.getAttribute && (
+            target.getAttribute("src") ||
+            target.getAttribute("href")
+          ) ||
+          "";
+
+        addDebug("resource", tag + " load failed", url);
+        updateDebugPanel(true);
+        return;
+      }
+
+      addDebug(
+        "error",
+        event.message || "window error",
+        (event.filename || "") + ":" + (event.lineno || "") + ":" + (event.colno || "")
+      );
+      updateDebugPanel(true);
+    } catch (_) {}
+  }, true);
+
+  window.addEventListener("unhandledrejection", (event) => {
+    try {
+      const reason = event.reason;
+      addDebug(
+        "error",
+        "Unhandled promise rejection",
+        reason && reason.stack ? reason.stack : String(reason)
+      );
+      updateDebugPanel(true);
+    } catch (_) {}
+  });
+
+  document.addEventListener("DOMContentLoaded", () => {
+    addDebug("info", "DOMContentLoaded", "title=" + document.title);
+    forceWhiteBackground();
+    setTimeout(() => updateDebugPanel(visibleTextLength() < 5), 100);
+  });
+
+  window.addEventListener("load", () => {
+    addDebug("info", "window load", "textLength=" + visibleTextLength());
+    forceWhiteBackground();
+    setTimeout(() => updateDebugPanel(visibleTextLength() < 5), 200);
+  });
+
+  setTimeout(() => {
+    forceWhiteBackground();
+    addDebug(
+      "info",
+      "2초 상태 점검",
+      "textLength=" + visibleTextLength() + ", hasMain=" + hasGeminiMainElement()
+    );
+    updateDebugPanel(visibleTextLength() < 5);
+  }, 2000);
+
+  setTimeout(() => {
+    forceWhiteBackground();
+
+    if (visibleTextLength() < 5) {
+      addDebug(
+        "warn",
+        "화면이 비어 있습니다. 강제 디버그 패널을 표시합니다.",
+        "대부분 script/module 로드 실패, MIME 오류, 차단 도메인, 라우터 경로 문제입니다."
+      );
+      updateDebugPanel(true);
+    }
+  }, 4500);
 
   function skipUrl(value) {
     const v = String(value || "").trim();
@@ -619,13 +818,35 @@ function makeClientPatchScript(originalUrl, injectedScript) {
   if (nativeFetch) {
     window.fetch = function(input, init) {
       try {
+        const rawUrl = input instanceof Request ? input.url : input;
+        const nextUrl = proxify(rawUrl);
+
+        addDebug("fetch", String(rawUrl), "=> " + String(nextUrl));
+
         if (input instanceof Request) {
-          const req = new Request(proxify(input.url), input);
-          return nativeFetch(req, init);
+          const req = new Request(nextUrl, input);
+          return nativeFetch(req, init).then((res) => {
+            addDebug("fetch", "response " + res.status, nextUrl);
+            if (!res.ok) updateDebugPanel(true);
+            return res;
+          }).catch((e) => {
+            addDebug("error", "fetch failed", String(nextUrl) + "\\n" + (e && e.stack ? e.stack : String(e)));
+            updateDebugPanel(true);
+            throw e;
+          });
         }
 
-        return nativeFetch(proxify(input), init);
-      } catch (_) {
+        return nativeFetch(nextUrl, init).then((res) => {
+          addDebug("fetch", "response " + res.status, nextUrl);
+          if (!res.ok) updateDebugPanel(true);
+          return res;
+        }).catch((e) => {
+          addDebug("error", "fetch failed", String(nextUrl) + "\\n" + (e && e.stack ? e.stack : String(e)));
+          updateDebugPanel(true);
+          throw e;
+        });
+      } catch (e) {
+        addDebug("error", "fetch patch error", e && e.stack ? e.stack : String(e));
         return nativeFetch(input, init);
       }
     };
@@ -633,9 +854,27 @@ function makeClientPatchScript(originalUrl, injectedScript) {
 
   if (window.XMLHttpRequest && XMLHttpRequest.prototype.open) {
     const nativeOpen = XMLHttpRequest.prototype.open;
+    const nativeSend = XMLHttpRequest.prototype.send;
 
     XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-      return nativeOpen.call(this, method, proxify(url), ...rest);
+      try {
+        this.__proxyDebugUrl = proxify(url);
+        addDebug("xhr", method + " " + String(url), "=> " + this.__proxyDebugUrl);
+        return nativeOpen.call(this, method, this.__proxyDebugUrl, ...rest);
+      } catch (_) {
+        return nativeOpen.call(this, method, url, ...rest);
+      }
+    };
+
+    XMLHttpRequest.prototype.send = function(...args) {
+      try {
+        this.addEventListener("loadend", () => {
+          addDebug("xhr", "response " + this.status, this.__proxyDebugUrl || "");
+          if (this.status >= 400 || this.status === 0) updateDebugPanel(true);
+        });
+      } catch (_) {}
+
+      return nativeSend.apply(this, args);
     };
   }
 
@@ -643,7 +882,9 @@ function makeClientPatchScript(originalUrl, injectedScript) {
     const nativeBeacon = navigator.sendBeacon.bind(navigator);
 
     navigator.sendBeacon = function(url, data) {
-      return nativeBeacon(proxify(url), data);
+      const nextUrl = proxify(url);
+      addDebug("beacon", String(url), "=> " + String(nextUrl));
+      return nativeBeacon(nextUrl, data);
     };
   }
 
@@ -651,7 +892,9 @@ function makeClientPatchScript(originalUrl, injectedScript) {
     const NativeEventSource = window.EventSource;
 
     window.EventSource = function(url, config) {
-      return new NativeEventSource(proxify(url), config);
+      const nextUrl = proxify(url);
+      addDebug("eventsource", String(url), "=> " + String(nextUrl));
+      return new NativeEventSource(nextUrl, config);
     };
 
     window.EventSource.prototype = NativeEventSource.prototype;
@@ -684,6 +927,12 @@ function makeClientPatchScript(originalUrl, injectedScript) {
     if (!el || el.nodeType !== 1) return;
 
     try {
+      if (el.tagName === "BASE") {
+        el.setAttribute("href", "/");
+        addDebug("info", "base href forced to /");
+        return;
+      }
+
       for (const attr of URL_ATTRS) {
         if (el.hasAttribute && el.hasAttribute(attr)) {
           const oldValue = el.getAttribute(attr);
@@ -691,6 +940,10 @@ function makeClientPatchScript(originalUrl, injectedScript) {
 
           if (newValue !== oldValue) {
             el.setAttribute(attr, newValue);
+
+            if (el.tagName === "SCRIPT" || el.tagName === "LINK" || el.tagName === "IFRAME") {
+              addDebug("rewrite", el.tagName + " " + attr, oldValue + " => " + newValue);
+            }
           }
         }
       }
@@ -725,7 +978,9 @@ function makeClientPatchScript(originalUrl, injectedScript) {
       ) {
         el.removeAttribute("integrity");
       }
-    } catch (_) {}
+    } catch (e) {
+      addDebug("error", "patchElement error", e && e.stack ? e.stack : String(e));
+    }
   }
 
   if (window.Element && Element.prototype.setAttribute) {
@@ -734,13 +989,17 @@ function makeClientPatchScript(originalUrl, injectedScript) {
     Element.prototype.setAttribute = function(name, value) {
       const n = String(name).toLowerCase();
 
-      if (URL_ATTRS.has(n)) {
-        value = proxify(value);
-      } else if (SRCSET_ATTRS.has(n)) {
-        value = rewriteSrcset(value);
-      } else if (n === "style") {
-        value = rewriteCssText(value);
-      }
+      try {
+        if (this && this.tagName === "BASE" && n === "href") {
+          value = "/";
+        } else if (URL_ATTRS.has(n)) {
+          value = proxify(value);
+        } else if (SRCSET_ATTRS.has(n)) {
+          value = rewriteSrcset(value);
+        } else if (n === "style") {
+          value = rewriteCssText(value);
+        }
+      } catch (_) {}
 
       return nativeSetAttribute.call(this, name, value);
     };
@@ -798,9 +1057,12 @@ function makeClientPatchScript(originalUrl, injectedScript) {
       for (const el of all) {
         patchElement(el);
       }
-    } catch (_) {}
+    } catch (e) {
+      addDebug("error", "patchTree error", e && e.stack ? e.stack : String(e));
+    }
   }
 
+  forceWhiteBackground();
   patchTree(document.documentElement);
 
   try {
@@ -833,14 +1095,18 @@ function makeClientPatchScript(originalUrl, injectedScript) {
         "target"
       ]
     });
-  } catch (_) {}
+  } catch (e) {
+    addDebug("error", "MutationObserver failed", e && e.stack ? e.stack : String(e));
+  }
 
   try {
     if (USER_SCRIPT && USER_SCRIPT.trim()) {
       new Function(USER_SCRIPT).call(window);
+      addDebug("info", "user script executed");
     }
   } catch (e) {
-    console.error("[Proxy injected script error]", e);
+    addDebug("error", "Injected user script error", e && e.stack ? e.stack : String(e));
+    updateDebugPanel(true);
   }
 })();
 </script>`;
@@ -856,6 +1122,11 @@ class UrlAttributeRewriter {
 
   element(element) {
     const tag = element.tagName ? element.tagName.toLowerCase() : "";
+
+    if (tag === "base") {
+      element.setAttribute("href", "/");
+      return;
+    }
 
     for (const attr of URL_ATTRS) {
       const value = element.getAttribute(attr);
@@ -925,29 +1196,29 @@ class UrlAttributeRewriter {
 }
 
 class HeadInjector {
-  constructor(baseUrl, injectedScript) {
+  constructor(baseUrl, userScript) {
     this.baseUrl = baseUrl;
-    this.injectedScript = injectedScript;
+    this.userScript = userScript;
   }
 
   element(element) {
-    element.prepend(makeClientPatchScript(this.baseUrl, this.injectedScript), {
+    element.prepend(makeClientPatchScript(this.baseUrl, this.userScript), {
       html: true
     });
   }
 }
 
 class HtmlFallbackInjector {
-  constructor(baseUrl, injectedScript) {
+  constructor(baseUrl, userScript) {
     this.baseUrl = baseUrl;
-    this.injectedScript = injectedScript;
+    this.userScript = userScript;
     this.done = false;
   }
 
   element(element) {
     if (this.done) return;
 
-    element.prepend(makeClientPatchScript(this.baseUrl, this.injectedScript), {
+    element.prepend(makeClientPatchScript(this.baseUrl, this.userScript), {
       html: true
     });
 
@@ -1030,7 +1301,10 @@ async function proxyRequest(context, targetUrl) {
 
   const primaryTarget = envText(env, "TARGET_URL", DEFAULT_TARGET_URL);
   const allowAnyHttps = envBool(env, "ALLOW_ANY_HTTPS", DEFAULT_ALLOW_ANY_HTTPS);
-  const injectedScript = envText(env, "INJECTED_SCRIPT", DEFAULT_INJECTED_SCRIPT);
+
+  const extraUserScript = envText(env, "INJECTED_SCRIPT", "");
+  const userScript = DEFAULT_USER_SCRIPT + "\n\n" + extraUserScript;
+
   const hostSuffixes = getHostSuffixes(primaryTarget);
 
   if (!isAllowedTarget(normalizedTarget, allowAnyHttps, hostSuffixes)) {
@@ -1130,8 +1404,8 @@ async function proxyRequest(context, targetUrl) {
     });
 
     return new HTMLRewriter()
-      .on("head", new HeadInjector(normalizedTarget, injectedScript))
-      .on("html", new HtmlFallbackInjector(normalizedTarget, injectedScript))
+      .on("head", new HeadInjector(normalizedTarget, userScript))
+      .on("html", new HtmlFallbackInjector(normalizedTarget, userScript))
       .on("*", new UrlAttributeRewriter(
         normalizedTarget,
         appOrigin,
@@ -1198,22 +1472,18 @@ export async function onRequest(context) {
   const target = envText(env, "TARGET_URL", DEFAULT_TARGET_URL);
   const targetUrl = new URL(target);
 
-  // 핵심 수정:
-  // 루트 / 로 접속하면 Gemini 원본의 실제 path로 로컬 주소를 맞춤
-  // 예: / → /share/dbf04c4d0c13
   if (url.pathname === "/" && targetUrl.pathname !== "/") {
     const localShareUrl = new URL(request.url);
     localShareUrl.pathname = targetUrl.pathname;
-    localShareUrl.search = targetUrl.search;
+    localShareUrl.search = targetUrl.search || url.search;
 
     return Response.redirect(localShareUrl.href, 302);
   }
 
-  // /share/dbf04c4d0c13 로 들어온 경우,
-  // 현재 로컬 path/search를 Gemini 원본 origin에 붙여서 가져옴
   const upstreamUrl = new URL(target);
+
   upstreamUrl.pathname = url.pathname;
   upstreamUrl.search = url.search || targetUrl.search;
 
   return proxyRequest(context, upstreamUrl.href);
-}
+    }
