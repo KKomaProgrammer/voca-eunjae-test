@@ -4,19 +4,64 @@ const DEFAULT_TARGET_URL = "https://gemini.google.com/share/dbf04c4d0c13";
 
 const DEFAULT_INJECTED_SCRIPT = `
 (() => {
-  function cleanGeminiUI() {
-    try { document.querySelector("top-bar-actions")?.remove(); } catch (_) {}
-    try { document.querySelector(".footer")?.remove(); } catch (_) {}
+  function forceVisible() {
     try {
+      document.documentElement.style.background = "#fff";
+
+      if (document.body) {
+        document.body.style.background = "#fff";
+        document.body.style.color = "#111";
+      }
+
       document.documentElement.style.setProperty(
         "--bard-sidenav-open-closed-width-diff",
         "0px"
       );
     } catch (_) {}
-
-    // 사용자가 말한 document.querySelector("ch... 부분은 메시지에서 잘려 있어 넣지 않았습니다.
   }
 
+  function cleanGeminiUI() {
+    forceVisible();
+
+    try { document.querySelector("top-bar-actions")?.remove(); } catch (_) {}
+    try { document.querySelector(".footer")?.remove(); } catch (_) {}
+
+    /*
+      주의:
+      bard-app, chat-window, main, [role="main"], mat-sidenav-container 같은
+      핵심 요소는 remove() 하면 검은 화면/빈 화면이 됩니다.
+    */
+  }
+
+  function showDebugIfBlank() {
+    try {
+      const text = (document.body && document.body.innerText || "").trim();
+
+      const hasMain =
+        document.querySelector("bard-app") ||
+        document.querySelector("chat-window") ||
+        document.querySelector("main") ||
+        document.querySelector("[role='main']");
+
+      if (!text && !hasMain && !document.querySelector("#__proxy_blank_debug")) {
+        const box = document.createElement("div");
+
+        box.id = "__proxy_blank_debug";
+        box.style.cssText =
+          "position:fixed;inset:0;z-index:2147483647;background:white;color:#111;padding:20px;font:14px/1.6 system-ui,sans-serif;overflow:auto;";
+
+        box.innerHTML =
+          "<h2>Gemini 화면이 로드되지 않았습니다</h2>" +
+          "<p>HTML은 도착했지만 Gemini 앱 JavaScript 초기화가 실패했을 가능성이 큽니다.</p>" +
+          "<p>개발자도구 Console/Network에서 <b>Blocked host</b>, <b>403</b>, <b>404</b>, <b>CORS</b>, <b>module script</b> 오류를 확인하세요.</p>" +
+          "<p>사용자 주입 코드가 main, bard-app, chat-window 같은 핵심 요소를 지우면 화면이 비게 됩니다.</p>";
+
+        document.body.appendChild(box);
+      }
+    } catch (_) {}
+  }
+
+  forceVisible();
   cleanGeminiUI();
 
   try {
@@ -25,6 +70,8 @@ const DEFAULT_INJECTED_SCRIPT = `
       subtree: true
     });
   } catch (_) {}
+
+  setTimeout(showDebugIfBlank, 5000);
 })();
 `;
 
@@ -38,16 +85,28 @@ const DEFAULT_ALLOWED_HOST_SUFFIXES = [
   "www.google.com",
   "apis.google.com",
   "ogs.google.com",
+  "clients1.google.com",
+  "clients2.google.com",
+  "clients3.google.com",
+  "clients4.google.com",
+  "clients5.google.com",
+  "clients6.google.com",
 
   "gstatic.com",
   "www.gstatic.com",
+  "ssl.gstatic.com",
+  "fonts.gstatic.com",
 
   "googleusercontent.com",
   "lh3.googleusercontent.com",
+  "lh4.googleusercontent.com",
+  "lh5.googleusercontent.com",
+  "lh6.googleusercontent.com",
 
   "googleapis.com",
   "fonts.googleapis.com",
   "storage.googleapis.com",
+  "www.googleapis.com",
 
   "ggpht.com",
 
@@ -88,17 +147,29 @@ const SRCSET_ATTRS = [
 const STRIP_RESPONSE_HEADERS = [
   "content-security-policy",
   "content-security-policy-report-only",
+
   "x-frame-options",
   "frame-options",
+
   "cross-origin-opener-policy",
   "cross-origin-embedder-policy",
   "cross-origin-resource-policy",
+
   "permissions-policy",
+  "document-policy",
+  "require-document-policy",
+  "origin-trial",
+
   "clear-site-data",
+
   "content-length",
   "content-encoding",
   "transfer-encoding",
-  "alt-svc"
+  "alt-svc",
+
+  "report-to",
+  "reporting-endpoints",
+  "nel"
 ];
 
 const STRIP_REQUEST_HEADERS = [
@@ -202,7 +273,6 @@ function proxifyUrl(raw, baseUrl, appOrigin, allowAnyHttps, hostSuffixes) {
   const abs = toAbsoluteUrl(raw, baseUrl);
   if (!abs) return raw;
 
-  // 자기 자신의 Pages 주소는 다시 프록시하지 않음
   if (isSameOrigin(abs, appOrigin)) return abs;
 
   if (!isAllowedTarget(abs, allowAnyHttps, hostSuffixes)) return raw;
@@ -1000,7 +1070,6 @@ async function proxyRequest(context, targetUrl) {
 
   const location = upstream.headers.get("location");
 
-  // 리다이렉트는 서버가 계속 따라가지 않고, 브라우저에게 프록시 URL로 넘김
   if (
     upstream.status >= 300 &&
     upstream.status < 400 &&
@@ -1033,10 +1102,6 @@ async function proxyRequest(context, targetUrl) {
   const isCssResponse = /text\/css/i.test(contentType);
   const isDocumentRequest = isDocumentNavigationRequest(request);
 
-  // 핵심 수정:
-  // /__proxy?url=...gtm.js 같은 JS/CSS/이미지 주소가 화면 문서로 열리면
-  // JS 텍스트를 화면에 보여주지 않고 메인 HTML로 되돌림.
-  // 단, script/img/link/fetch 같은 리소스 요청은 그대로 반환함.
   if (isDocumentRequest && !isHtmlResponse) {
     if (requestUrl.pathname === "/__proxy") {
       return new Response(makeHtmlOnlyBlockPage(normalizedTarget, appOrigin), {
@@ -1127,11 +1192,9 @@ export async function onRequest(context) {
 
   if (url.pathname === "/__proxy") {
     const target = url.searchParams.get("url") || url.searchParams.get("u");
-
     return proxyRequest(context, target);
   }
 
   const target = envText(env, "TARGET_URL", DEFAULT_TARGET_URL);
-
   return proxyRequest(context, target);
-    }
+        }
